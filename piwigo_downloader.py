@@ -546,6 +546,7 @@ class DownloadStats:
     skipped: int = 0
     failed: int = 0
     bytes: int = 0
+    skipped_bytes: int = 0
     failures: list[tuple[int, str]] = field(default_factory=list)
 
 
@@ -767,12 +768,13 @@ class Downloader:
                 progress.update(0, counters)
                 return
             with lock:
-                stats.bytes += size
                 if status == "skipped":
                     stats.skipped += 1
+                    stats.skipped_bytes += size
                     counters["skipped"] += 1
                 else:
                     stats.done += 1
+                    stats.bytes += size
                     counters["done"] += 1
             progress.update(size, counters)
 
@@ -1065,7 +1067,7 @@ def run(args: argparse.Namespace) -> int:
     manifest = downloader.write_manifest(items, stats)
 
     log.info(
-        "完成：新增 %d / 跳过 %d / 失败 %d，共 %s，用时 %.1fs（%s/s）",
+        "完成：新增 %d 张 / 跳过 %d 张 / 失败 %d 张，新下载 %s，用时 %.1fs（%s/s）",
         stats.done,
         stats.skipped,
         stats.failed,
@@ -1073,6 +1075,8 @@ def run(args: argparse.Namespace) -> int:
         elapsed,
         human_size(int(stats.bytes / elapsed)),
     )
+    if stats.skipped:
+        log.info("已存在文件共 %s，未重复下载", human_size(stats.skipped_bytes))
     log.info("清单: %s", manifest)
     return EXIT_OK if stats.failed == 0 else EXIT_ERROR
 
