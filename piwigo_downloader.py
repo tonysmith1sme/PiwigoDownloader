@@ -817,31 +817,281 @@ class Downloader:
 
 
 # --------------------------------------------------------------------------- #
-# 入口（后续扩展）
+# 命令行入口
 # --------------------------------------------------------------------------- #
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_LOGIN_FAILED = 2
+EXIT_CREDENTIALS_NEEDED = 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="piwigo_downloader.py",
+        description="下载 Piwigo 图库中的全部照片（公开站点直连，私有站点登录后下载）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python piwigo_downloader.py https://gallery.example.com/ -o downloads\n"
+            "  python piwigo_downloader.py https://gallery.example.com/ -u USER -p PASS --threads 8\n"
+            "  python piwigo_downloader.py https://gallery.example.com/ --max-images 20 --dry-run\n"
+        ),
+    )
+    parser.add_argument("url", help="Piwigo 站点根地址，例如 https://gallery.example.com/")
+    parser.add_argument("-o", "--output", default="downloads", help="下载目录（默认 downloads）")
+    parser.add_argument("-u", "--username", help="Piwigo 用户名；不给则按需交互询问")
+    parser.add_argument("-p", "--password", help="Piwigo 密码；不建议明文写在命令里")
+    parser.add_argument(
+        "--ask-password",
+        action="store_true",
+        help="强制交互输入密码（覆盖 -p 与 PIWIGO_PASSWORD）",
+    )
+    parser.add_argument(
+        "--no-login-prompt",
+        action="store_true",
+        help="匿名不可读时不再询问，直接报错退出（适合脚本/定时任务）",
+    )
+    parser.add_argument("--threads", type=int, default=6, help="并发下载线程数（默认 6）")
+    parser.add_argument("--per-page", type=int, default=DEFAULT_PER_PAGE, help="接口分页大小")
+    parser.add_argument("--max-images", type=int, default=0, help="最多下载多少张（0 表示不限）")
+    parser.add_argument("--category", type=int, action="append", help="只下载指定分类 id，可重复")
+    parser.add_argument("--flat", action="store_true", help="不建分类子目录，全部平铺")
+    parser.add_argument("--dry-run", action="store_true", help="只枚举不下载，输出统计")
+    parser.add_argument("--list", action="store_true", help="只列出分类与张数")
+    parser.add_argument("--overwrite", action="store_true", help="已存在文件也重新下载")
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="单请求超时秒数")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="失败重试次数")
+    parser.add_argument("--delay", type=float, default=0.12, help="接口分页间隔秒数（默认 0.12）")
+    parser.add_argument("--proxy", help="HTTP(S) 代理，例如 http://127.0.0.1:7890")
+    parser.add_argument("--insecure", action="store_true", help="跳过 TLS 证书校验")
+    parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
+    parser.add_argument("--version", action="version", version=f"PiwigoDownloader {VERSION}")
+    return parser
+
+
+def prompt_credentials(attempt: int = 1) -> tuple[str, str] | None:
+    """交互式询问账号密码；非 TTY 返回 None。"""
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+    print("", file=sys.stderr)
+    if attempt > 1:
+        print(f"（第 {attempt} 次）账号或密码不正确，请重试。", file=sys.stderr)
+    try:
+        username = input("Piwigo 用户名: ").strip()
+        if not username:
+            return None
+        password = getpass.getpass("Piwigo 密码: ")
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return None
+    return username, password
+
+
+def collect_credentials(args: argparse.Namespace, allow_prompt: bool) -> tuple[str, str] | None:
+    """按 -u/-p/环境变量/交互的顺序取凭据。"""
+    username = (args.username or "").strip()
+    password = args.password or ""
+    if args.ask_password:
+        password = ""
+    if not password:
+        password = os.environ.get("PIWIGO_PASSWORD", "")
+    if username and password:
+        return username, password
+    if not allow_prompt:
+        return (username, password) if username and password else None
+
+    for attempt in range(1, 4):
+        if not username:
+            pair = prompt_credentials(attempt)
+            if pair is None:
+                return None
+            username, password = pair
+        elif not password:
+            try:
+                password = getpass.getpass(f"用户 {username} 的 Piwigo 密码: ")
+            except (EOFError, KeyboardInterrupt):
+                print("", file=sys.stderr)
+                return None
+        if username and password:
+            return username, password
+    return None
+
+
+def authenticate(client: PiwigoClient, args: argparse.Namespace, *, allow_prompt: bool) -> bool:
+    """需要登录时取凭据并尝试登录，失败允许有限次重试。"""
+    log.info("该站点需要账号密码才能读取图库内容，准备登录。")
+    attempts = 3 if allow_prompt else 1
+    for attempt in range(1, attempts + 1):
+        creds = collect_credentials(args, allow_prompt=allow_prompt)
+        if not creds or not creds[0] or not creds[1]:
+            return False
+        username, password = creds
+        if client.login(username, password):
+            log.info("登录成功，当前身份: %s", client.status_name())
+            return True
+        log.warning("登录失败：账号或密码不正确")
+        # 清空已用凭据，下一轮重新询问
+        args.username, args.password = None, ""
+    return False
+
+
+def run(args: argparse.Namespace) -> int:
+    client = PiwigoClient(
+        args.url,
+        timeout=args.timeout,
+        retries=args.retries,
+        delay=args.delay,
+        verify_tls=not args.insecure,
+        proxy=args.proxy,
+    )
+
+    # 1) 匿名探测
+    try:
+        info = client.probe()
+    except PiwigoError as exc:
+        log.error("站点不可用或不是 Piwigo: %s", exc)
+        return EXIT_ERROR
+    log.info(
+        "连接成功: %s (Piwigo %s)，当前身份 %s",
+        client.base_url,
+        info.get("version") or "?",
+        info.get("status") or "guest",
+    )
+
+    # 2) 需要时登录
+    if info["needs_auth"]:
+        log.info("匿名可见内容为空（%s）", info.get("reason") or "需要登录")
+        if not authenticate(client, args, allow_prompt=not args.no_login_prompt):
+            if args.no_login_prompt:
+                log.error("需要登录但已禁用交互提示，请用 -u/--username 与 -p/--password 提供凭据")
+            else:
+                log.error("未能获得有效凭据，退出")
+            return EXIT_CREDENTIALS_NEEDED
+        try:
+            info = client.probe()
+        except PiwigoError as exc:
+            log.error("登录后读取分类失败: %s", exc)
+            return EXIT_ERROR
+    elif args.username:
+        # 站点匿名可读，但用户仍提供了账号：登录以纳入私有内容
+        log.info("站点匿名可读，尝试用提供的账号纳入私有内容")
+        creds = collect_credentials(args, allow_prompt=not args.no_login_prompt)
+        if creds and client.login(*creds):
+            info = client.probe()
+        else:
+            log.warning("账号登录未成功，继续以游客身份下载公开内容")
+
+    categories = info["categories"]
+    if not categories:
+        log.error("没有读到任何分类，站点可能是空的或权限不足")
+        return EXIT_ERROR
+
+    if args.list:
+        for cat in categories:
+            depth = str(cat.get("uppercats") or "").count(",")
+            indent = "  " * depth
+            log.info(
+                "%s#%s %s (%s 张)",
+                indent,
+                cat.get("id"),
+                cat.get("name"),
+                cat.get("nb_images") or 0,
+            )
+        return EXIT_OK
+
+    # 3) 枚举
+    only = set(args.category) if args.category else None
+    try:
+        items = collect_images(
+            client,
+            categories,
+            per_page=args.per_page,
+            only_categories=only,
+            max_images=args.max_images or None,
+            flat=args.flat,
+        )
+    except AuthRequired:
+        log.error("枚举过程中被要求登录，请提供有效凭据后重试")
+        return EXIT_CREDENTIALS_NEEDED
+    except PiwigoError as exc:
+        log.error("枚举图片失败: %s", exc)
+        return EXIT_ERROR
+
+    log.info("待下载图片: %d 张", len(items))
+    if not items:
+        log.warning("没有符合条件的图片")
+        return EXIT_OK
+
+    if args.dry_run:
+        for item in items[:10]:
+            log.info(
+                "  #%s %s/%s",
+                item.image.id,
+                item.rel_dir,
+                safe_filename(item.image),
+            )
+        if len(items) > 10:
+            log.info("  ... 其余 %d 张省略", len(items) - 10)
+        log.info("dry-run 结束，未下载任何文件")
+        return EXIT_OK
+
+    # 4) 下载
+    out_dir = Path(args.output).expanduser()
+    downloader = Downloader(
+        client,
+        out_dir,
+        threads=args.threads,
+        timeout=max(args.timeout, 60.0),
+        retries=max(1, min(args.retries, 5)),
+        overwrite=args.overwrite,
+        progress=not args.no_progress,
+    )
+    started = time.monotonic()
+    stats = downloader.run(items)
+    elapsed = max(1e-6, time.monotonic() - started)
+    manifest = downloader.write_manifest(items, stats)
+
+    log.info(
+        "完成：新增 %d / 跳过 %d / 失败 %d，共 %s，用时 %.1fs（%s/s）",
+        stats.done,
+        stats.skipped,
+        stats.failed,
+        human_size(stats.bytes),
+        elapsed,
+        human_size(int(stats.bytes / elapsed)),
+    )
+    log.info("清单: %s", manifest)
+    return EXIT_OK if stats.failed == 0 else EXIT_ERROR
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    parser = argparse.ArgumentParser(description="下载 Piwigo 图库中的全部照片")
-    parser.add_argument("url", help="Piwigo 站点根地址，例如 https://gallery.example.com/")
-    parser.add_argument("--verbose", "-v", action="store_true", help="输出调试日志")
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-
-    client = PiwigoClient(args.url)
-    info = client.probe()
-    log.info("站点版本: %s / 当前身份: %s", info["version"], info["status"])
-    log.info(
-        "公开可读分类: %d 个，图片约 %d 张%s",
-        len(info["categories"]),
-        info["total_images"],
-        "，需要登录" if info["needs_auth"] else "",
-    )
-    return 0
+    if args.threads < 1:
+        parser.error("--threads 必须 >= 1")
+    if args.per_page < 1 or args.per_page > 500:
+        parser.error("--per-page 需在 1..500 之间")
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        log.warning("已中断")
+        return 130
+    except PiwigoError as exc:
+        log.error("%s", exc)
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":
