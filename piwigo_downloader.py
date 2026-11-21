@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -529,6 +530,290 @@ def _image_dir(image: ImageRef, fallback_cid: int, paths: dict[int, list[str]]) 
     if best is None:
         best = paths.get(fallback_cid) or [f"cat_{fallback_cid}"]
     return Path(*best)
+
+
+# --------------------------------------------------------------------------- #
+# 下载器
+# --------------------------------------------------------------------------- #
+@dataclass
+class DownloadStats:
+    total: int = 0
+    done: int = 0
+    skipped: int = 0
+    failed: int = 0
+    bytes: int = 0
+    failures: list[tuple[int, str]] = field(default_factory=list)
+
+
+class Progress:
+    """轻量进度条：不依赖 tqdm，非 TTY 时降级为节流日志。"""
+
+    def __init__(self, total: int, enabled: bool = True, stream: Any = None) -> None:
+        self.total = max(0, total)
+        self.enabled = enabled
+        self.stream = stream or sys.stderr
+        self.start = time.monotonic()
+        self.done = 0
+        self.bytes = 0
+        self._last_render = 0.0
+        self._lock = threading.Lock()
+        self._isatty = bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def update(self, nbytes: int = 0, results: dict[str, int] | None = None) -> None:
+        with self._lock:
+            self.done += 1
+            self.bytes += max(0, nbytes)
+            if not self.enabled:
+                return
+            now = time.monotonic()
+            if now - self._last_render < 0.2 and self.done < self.total:
+                return
+            self._last_render = now
+            self._render(results or {})
+
+    def _render(self, results: dict[str, int]) -> None:
+        elapsed = max(1e-6, time.monotonic() - self.start)
+        pct = (self.done / self.total * 100) if self.total else 100.0
+        speed = self.bytes / elapsed
+        line = (
+            f"下载 {self.done}/{self.total} ({pct:5.1f}%) "
+            f"{human_size(self.bytes)}  {human_size(int(speed))}/s"
+        )
+        if results:
+            extra = " ".join(f"{k}={v}" for k, v in results.items() if v)
+            if extra:
+                line = f"{line}  {extra}"
+        width = 0
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 100
+        line = line[: max(20, width - 1)]
+        if self._isatty:
+            self.stream.write("\r" + line.ljust(max(20, width - 1)))
+        else:
+            self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        if self._isatty:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
+def human_size(num: float) -> str:
+    value = float(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1024.0 or unit == "TB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{value:.1f}TB"
+
+
+class Downloader:
+    """并发下载 + 断点续传 + 结果清单。"""
+
+    def __init__(
+        self,
+        client: PiwigoClient,
+        out_dir: Path,
+        *,
+        threads: int = 6,
+        timeout: float = DEFAULT_TIMEOUT,
+        retries: int = 2,
+        overwrite: bool = False,
+        progress: bool = True,
+    ) -> None:
+        self.client = client
+        self.out_dir = Path(out_dir)
+        self.threads = max(1, threads)
+        self.timeout = timeout
+        self.retries = max(0, retries)
+        self.overwrite = overwrite
+        self.show_progress = progress
+        self._local = threading.local()
+        self._claimed: dict[Path, int] = {}
+        self._claim_lock = threading.Lock()
+
+    # -- 会话 -------------------------------------------------------------- #
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self.client.session.headers)
+            session.cookies.update(self.client.session.cookies)
+            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=32, max_retries=0)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            session.proxies.update(self.client.session.proxies)
+            self._local.session = session
+        return session
+
+    # -- 目标路径 ---------------------------------------------------------- #
+    def resolve_dest(self, item: CatalogItem) -> Path:
+        directory = self.out_dir / item.rel_dir
+        name = safe_filename(item.image)
+        dest = directory / name
+        with self._claim_lock:
+            owner = self._claimed.get(dest)
+            if owner is not None and owner != item.image.id:
+                # 同目录同名但不同图片：加 id 区分，绝不互相覆盖
+                stem, ext = os.path.splitext(name)
+                dest = directory / f"{stem}~{item.image.id}{ext}"
+            self._claimed.setdefault(dest, item.image.id)
+        return dest
+
+    # -- 单张下载 ---------------------------------------------------------- #
+    def download_one(self, item: CatalogItem) -> tuple[str, int]:
+        url = item.image.best_url()
+        if not url:
+            raise PiwigoError(f"图片 #{item.image.id} 没有可用地址")
+
+        dest = self.resolve_dest(item)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
+
+        if dest.exists() and dest.stat().st_size > 0 and not self.overwrite:
+            return "skipped", dest.stat().st_size
+
+        written = 0
+        last_err: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                written = self._stream_to_file(url, part, dest)
+                os.replace(part, dest)
+                return "done", written
+            except AuthRequired:
+                raise
+            except (requests.RequestException, PiwigoError, OSError) as exc:
+                last_err = exc
+                if attempt < self.retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+        raise PiwigoError(f"下载失败 {url}: {last_err}")
+
+    def _stream_to_file(self, url: str, part: Path, dest: Path) -> int:
+        headers: dict[str, str] = {}
+        offset = 0
+        if part.exists() and part.stat().st_size > 0:
+            offset = part.stat().st_size
+            headers["Range"] = f"bytes={offset}-"
+
+        session = self._session()
+        with session.get(
+            url,
+            headers=headers or None,
+            timeout=self.timeout,
+            stream=True,
+            verify=self.client.verify_tls,
+            allow_redirects=True,
+        ) as resp:
+            if resp.status_code in (401, 403):
+                raise AuthRequired(f"图片地址需要登录: {url}")
+            if resp.status_code == 416 and offset:
+                part.unlink(missing_ok=True)
+                return self._stream_to_file(url, part, dest)
+            if offset and resp.status_code != 206:
+                offset = 0
+                part.unlink(missing_ok=True)
+            resp.raise_for_status()
+
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" in ctype:
+                raise PiwigoError(f"返回了 HTML（可能是登录页或错误页）: {url}")
+
+            mode = "ab" if offset else "wb"
+            total = 0
+            with part.open(mode) as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 16):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    total += len(chunk)
+            if total == 0 and not (part.exists() and part.stat().st_size > 0):
+                raise PiwigoError(f"下载内容为空: {url}")
+        return part.stat().st_size if part.exists() else 0
+
+    # -- 批量下载 ---------------------------------------------------------- #
+    def run(self, items: Sequence[CatalogItem]) -> DownloadStats:
+        with self._claim_lock:
+            self._claimed.clear()
+        stats = DownloadStats(total=len(items))
+        progress = Progress(len(items), enabled=self.show_progress)
+        counters = {"done": 0, "skipped": 0, "failed": 0}
+        lock = threading.Lock()
+
+        def work(item: CatalogItem) -> None:
+            try:
+                status, size = self.download_one(item)
+            except AuthRequired as exc:
+                with lock:
+                    stats.failed += 1
+                    stats.failures.append((item.image.id, f"需要登录: {exc}"))
+                    counters["failed"] += 1
+                return
+            except Exception as exc:  # noqa: BLE001 - 单图失败不终止整体
+                with lock:
+                    stats.failed += 1
+                    stats.failures.append((item.image.id, str(exc)))
+                    counters["failed"] += 1
+                log.debug("图片 #%s 失败: %s", item.image.id, exc)
+                progress.update(0, counters)
+                return
+            with lock:
+                stats.bytes += size
+                if status == "skipped":
+                    stats.skipped += 1
+                    counters["skipped"] += 1
+                else:
+                    stats.done += 1
+                    counters["done"] += 1
+            progress.update(size, counters)
+
+        if self.threads == 1:
+            for item in items:
+                work(item)
+        else:
+            with ThreadPoolExecutor(max_workers=self.threads) as pool:
+                list(pool.map(work, items))
+        progress.close()
+        if stats.failures:
+            log.warning("有 %d 张下载失败，前 5 条：", len(stats.failures))
+            for image_id, reason in stats.failures[:5]:
+                log.warning("  #%s %s", image_id, reason)
+        return stats
+
+    # -- 清单 -------------------------------------------------------------- #
+    def write_manifest(self, items: Sequence[CatalogItem], stats: DownloadStats) -> Path:
+        path = self.out_dir / "manifest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "site": self.client.base_url,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "tool": f"PiwigoDownloader/{VERSION}",
+            "username": self.client.username,
+            "total": stats.total,
+            "done": stats.done,
+            "skipped": stats.skipped,
+            "failed": stats.failed,
+            "items": [
+                {
+                    "id": item.image.id,
+                    "file": safe_filename(item.image),
+                    "dir": str(item.rel_dir).replace("\\", "/"),
+                    "url": item.image.best_url(),
+                    "page_url": item.image.page_url,
+                    "width": item.image.width,
+                    "height": item.image.height,
+                    "date": item.image.date_available,
+                }
+                for item in items
+            ],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
 
 # --------------------------------------------------------------------------- #
