@@ -1,5 +1,7 @@
 # PiwigoDownloader
 
+[English](README.md) | **简体中文**
+
 批量下载 [Piwigo](https://piwigo.org/) 图库站点上的全部照片。公开站点直接开爬；遇到需要账号密码的站点会自动提示输入用户名与密码，登录后再抓。
 
 ## 特性
