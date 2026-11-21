@@ -374,6 +374,164 @@ def normalize_base_url(url: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 命名与目录规划
+# --------------------------------------------------------------------------- #
+_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def safe_component(text: str, fallback: str = "item", max_len: int = 80) -> str:
+    """把任意字符串净化成可跨平台的文件/目录名片段。"""
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = _INVALID_CHARS.sub("_", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value:
+        value = fallback
+    if value.split(".")[0].upper() in _WIN_RESERVED:
+        value = f"_{value}"
+    value = value[:max_len].rstrip(" .")
+    return value or fallback
+
+
+def _url_suffix(url: str) -> str:
+    path = (url or "").split("?", 1)[0].split("#", 1)[0]
+    _, ext = os.path.splitext(path)
+    ext = re.sub(r"[^A-Za-z0-9.]", "", ext)
+    return ext if 1 < len(ext) <= 11 else ""
+
+
+def safe_filename(image: ImageRef, max_len: int = 120) -> str:
+    """原文件名优先，缺失时用 id；扩展名从 file 或原图 URL 推断。"""
+    raw = str(image.file or image.name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    stem, ext = os.path.splitext(raw)
+    ext = re.sub(r"[^A-Za-z0-9.]", "", ext)
+    if len(ext) < 2:
+        ext = _url_suffix(image.element_url) or _url_suffix(image.download_url)
+    if not stem:
+        stem = f"image-{image.id}"
+    if not ext:
+        ext = ".jpg"
+    stem = safe_component(stem, f"image-{image.id}", max(16, max_len - len(ext)))
+    return f"{stem}{ext}"
+
+
+def build_category_paths(categories: Sequence[dict[str, Any]]) -> dict[int, list[str]]:
+    """按 uppercats 还原目录层级；同级重名追加 id 以免互相覆盖。"""
+    by_id: dict[int, dict[str, Any]] = {}
+    for cat in categories:
+        try:
+            by_id[int(cat.get("id"))] = cat
+        except (TypeError, ValueError):
+            continue
+
+    name_cache: dict[int, str] = {}
+    used: dict[tuple[int | None, str], int] = {}
+    for cid in sorted(by_id):
+        cat = by_id[cid]
+        parent = _parent_id(cat, by_id)
+        name = safe_component(str(cat.get("name") or ""), f"cat_{cid}", 60)
+        key = (parent, name.casefold())
+        if key in used:
+            name = f"{name} ({cid})"
+        used[key] = cid
+        name_cache[cid] = name
+
+    paths: dict[int, list[str]] = {}
+    for cid in by_id:
+        chain: list[str] = []
+        current: int | None = cid
+        guard = 0
+        while current is not None and guard < 128:
+            guard += 1
+            chain.append(name_cache.get(current, f"cat_{current}"))
+            current = _parent_id(by_id.get(current, {}), by_id)
+        paths[cid] = list(reversed(chain))
+    return paths
+
+
+def _parent_id(cat: dict[str, Any], by_id: dict[int, dict[str, Any]]) -> int | None:
+    parent = cat.get("id_uppercat")
+    if parent in (None, "", 0, "0"):
+        return None
+    try:
+        pid = int(parent)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid in by_id else None
+
+
+@dataclass
+class CatalogItem:
+    """一张待下载的图片及其目标子目录。"""
+
+    image: ImageRef
+    rel_dir: Path
+
+
+def collect_images(
+    client: PiwigoClient,
+    categories: Sequence[dict[str, Any]],
+    *,
+    per_page: int = DEFAULT_PER_PAGE,
+    only_categories: set[int] | None = None,
+    max_images: int | None = None,
+    flat: bool = False,
+) -> list[CatalogItem]:
+    """遍历全部分类，去重后返回待下载清单。"""
+    paths = build_category_paths(categories)
+    seen: set[int] = set()
+    items: list[CatalogItem] = []
+
+    for cat in categories:
+        try:
+            cid = int(cat.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if only_categories and cid not in only_categories:
+            continue
+        try:
+            nb_images = int(cat.get("nb_images") or 0)
+        except (TypeError, ValueError):
+            nb_images = 0
+        if nb_images <= 0:
+            continue
+
+        log.info("枚举分类 #%s %s（%d 张）", cid, cat.get("name"), nb_images)
+        for raw in client.iter_category_images(cid, per_page):
+            image = ImageRef.from_api(raw)
+            if image.id in seen:
+                continue
+            seen.add(image.id)
+            rel_dir = Path() if flat else _image_dir(image, cid, paths)
+            items.append(CatalogItem(image=image, rel_dir=rel_dir))
+            if max_images and len(items) >= max_images:
+                log.info("达到 --max-images=%d 限制，停止枚举", max_images)
+                return items
+        log.debug("分类 #%s 完成，累计 %d 张", cid, len(items))
+    return items
+
+
+def _image_dir(image: ImageRef, fallback_cid: int, paths: dict[int, list[str]]) -> Path:
+    """取该图片所属层级最深的分类作为存放目录。"""
+    best: list[str] | None = None
+    for cat in image.categories:
+        try:
+            cid = int(cat.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        candidate = paths.get(cid)
+        if candidate and (best is None or len(candidate) > len(best)):
+            best = candidate
+    if best is None:
+        best = paths.get(fallback_cid) or [f"cat_{fallback_cid}"]
+    return Path(*best)
+
+
+# --------------------------------------------------------------------------- #
 # 入口（后续扩展）
 # --------------------------------------------------------------------------- #
 def main(argv: Sequence[str] | None = None) -> int:
