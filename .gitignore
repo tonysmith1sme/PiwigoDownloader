@@ -1,5 +1,6 @@
 # 下载产物
 downloads/
+downloads_test/
 photos/
 out/
 *.part
