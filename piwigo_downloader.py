@@ -847,6 +847,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="强制交互输入密码（覆盖 -p 与 PIWIGO_PASSWORD）",
     )
     parser.add_argument(
+        "--force-login",
+        action="store_true",
+        help="即使匿名可读也先登录（用于纳入私有相册）",
+    )
+    parser.add_argument(
         "--no-login-prompt",
         action="store_true",
         help="匿名不可读时不再询问，直接报错退出（适合脚本/定时任务）",
@@ -960,13 +965,16 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # 2) 需要时登录
-    if info["needs_auth"]:
-        log.info("匿名可见内容为空（%s）", info.get("reason") or "需要登录")
+    if info["needs_auth"] or (args.force_login and client.is_guest()):
+        if info["needs_auth"]:
+            log.info("匿名可见内容为空（%s）", info.get("reason") or "需要登录")
+        else:
+            log.info("按 --force-login 要求先登录")
         if not authenticate(client, args, allow_prompt=not args.no_login_prompt):
             if args.no_login_prompt:
-                log.error("需要登录但已禁用交互提示，请用 -u/--username 与 -p/--password 提供凭据")
+                log.error("登录未成功：请检查 -u/--username 与 -p/--password（当前已禁用交互提示）")
             else:
-                log.error("未能获得有效凭据，退出")
+                log.error("未获得有效凭据，退出")
             return EXIT_CREDENTIALS_NEEDED
         try:
             info = client.probe()
