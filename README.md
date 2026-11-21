@@ -40,6 +40,9 @@ python piwigo_downloader.py https://example.com/piwigo/ -o downloads
 # Piwigo 密码:   ______
 ```
 
+> The script's console messages are in Simplified Chinese; the prompts above are its literal output.
+> Set `PIWIGO_PASSWORD` (or pass `-u`/`-p`) to run it unattended.
+
 Credentials can also be supplied explicitly (passwords on the command line end up in shell history):
 
 ```bash
