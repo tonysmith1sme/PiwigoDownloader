@@ -1,0 +1,23 @@
+# 下载产物
+downloads/
+photos/
+out/
+*.part
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 本地测试残留
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 运行期日志与清单
+*.log
+manifest.json
