@@ -62,6 +62,26 @@ class CategoryPathTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 地址规范化
+# --------------------------------------------------------------------------- #
+class NormalizeUrlTest(unittest.TestCase):
+    def test_adds_scheme_and_strips_slash(self):
+        self.assertEqual(pd.normalize_base_url("gallery.example.com/"), "https://gallery.example.com")
+
+    def test_strips_entry_file_and_query(self):
+        self.assertEqual(
+            pd.normalize_base_url("https://h/index.php?/category/154"),
+            "https://h",
+        )
+        self.assertEqual(pd.normalize_base_url("https://h/ws.php"), "https://h")
+
+    def test_keeps_subdirectory(self):
+        self.assertEqual(
+            pd.normalize_base_url(" http://h/piwigo/index.php "), "http://h/piwigo"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 图片地址选择
 # --------------------------------------------------------------------------- #
 class BestUrlTest(unittest.TestCase):

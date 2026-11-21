@@ -345,8 +345,6 @@ class PiwigoClient:
             result["needs_auth"] = True
             result["reason"] = "接口返回 401/403"
             return result
-        except PiwigoError as exc:
-            raise exc
 
         total = 0
         for c in cats:
@@ -366,11 +364,17 @@ class PiwigoClient:
 
 
 def normalize_base_url(url: str) -> str:
-    url = (url or "").strip()
+    """接受站点根、带页面路径或直接粘贴的入口文件，统一成根地址。"""
+    url = (url or "").strip().strip("'\"")
     if not url:
         raise PiwigoError("站点地址为空")
     if not re.match(r"^https?://", url, re.I):
         url = "https://" + url
+    url = url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    # 允许直接粘贴 index.php / ws.php / picture.php 等入口
+    url = re.sub(
+        r"/(?:index|ws|picture|identification|action|admin|search)\.php$", "", url, flags=re.I
+    )
     return url.rstrip("/")
 
 
