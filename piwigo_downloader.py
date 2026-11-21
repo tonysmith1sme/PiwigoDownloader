@@ -201,17 +201,37 @@ class PiwigoClient:
                 time.sleep(0.4 * (attempt + 1))
         raise PiwigoError(f"请求接口 {method} 失败: {last_err}")
 
+    @staticmethod
+    def parse_payload(text: str) -> dict[str, Any] | None:
+        """解析响应体；容忍 PHP Notice/Warning 先于 JSON 输出的脏响应。"""
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except ValueError:
+            pass
+        # 有些站点在 JSON 之前打印了 6~7KB 的 PHP 通知，直接切出 JSON 片段
+        start = text.find('{"stat"')
+        if start < 0:
+            start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
     def api(self, method: str, *, http_method: str = "GET", **params: Any) -> Any:
         """调用 WS 方法，返回 result 字段；stat!=ok 时抛错。"""
         resp = self._request(method, params, http_method=http_method)
         text = resp.text or ""
-        try:
-            data = resp.json()
-        except ValueError as exc:
+        data = self.parse_payload(text)
+        if data is None:
             head = text.strip()[:160].replace("\n", " ")
-            raise PiwigoError(f"接口 {method} 返回非 JSON 内容: {head!r}") from exc
-        if not isinstance(data, dict):
-            raise PiwigoError(f"接口 {method} 返回结构异常: {type(data).__name__}")
+            raise PiwigoError(f"接口 {method} 返回非 JSON 内容: {head!r}")
         if data.get("stat") != "ok":
             err = data.get("err")
             msg = data.get("message") or data.get("err") or "未知错误"
@@ -316,7 +336,11 @@ class PiwigoClient:
         guard = 0
         while guard < 20000:
             guard += 1
-            images, total = self.category_images_page(cat_id, page, per_page)
+            try:
+                images, total = self.category_images_page(cat_id, page, per_page)
+            except PiwigoError as exc:
+                log.warning("分类 #%s 第 %d 页读取失败，停止该分类：%s", cat_id, page, exc)
+                return
             if not images:
                 return
             for raw in images:
@@ -506,16 +530,22 @@ def collect_images(
             continue
 
         log.info("枚举分类 #%s %s（%d 张）", cid, cat.get("name"), nb_images)
-        for raw in client.iter_category_images(cid, per_page):
-            image = ImageRef.from_api(raw)
-            if image.id in seen:
-                continue
-            seen.add(image.id)
-            rel_dir = Path() if flat else _image_dir(image, cid, paths)
-            items.append(CatalogItem(image=image, rel_dir=rel_dir))
-            if max_images and len(items) >= max_images:
-                log.info("达到 --max-images=%d 限制，停止枚举", max_images)
-                return items
+        try:
+            for raw in client.iter_category_images(cid, per_page):
+                image = ImageRef.from_api(raw)
+                if image.id in seen:
+                    continue
+                seen.add(image.id)
+                rel_dir = Path() if flat else _image_dir(image, cid, paths)
+                items.append(CatalogItem(image=image, rel_dir=rel_dir))
+                if max_images and len(items) >= max_images:
+                    log.info("达到 --max-images=%d 限制，停止枚举", max_images)
+                    return items
+        except AuthRequired:
+            raise
+        except PiwigoError as exc:
+            log.warning("分类 #%s 枚举失败，跳过：%s", cid, exc)
+            continue
         log.debug("分类 #%s 完成，累计 %d 张", cid, len(items))
     return items
 

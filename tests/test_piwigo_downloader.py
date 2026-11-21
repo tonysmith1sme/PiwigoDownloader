@@ -82,6 +82,47 @@ class NormalizeUrlTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 响应解析（脏响应容错）
+# --------------------------------------------------------------------------- #
+class ParsePayloadTest(unittest.TestCase):
+    def test_plain_json(self):
+        data = pd.PiwigoClient.parse_payload('{"stat":"ok","result":{"a":1}}')
+        self.assertEqual(data["result"]["a"], 1)
+
+    def test_php_notice_prefix_is_skipped(self):
+        noisy = (
+            '<br />\n<b>Notice</b>:  Undefined offset: 150 in '
+            '<b>/www/wwwroot/site/include/ws_functions/pwg.categories.php</b> '
+            'on line <b>188</b><br />\n<br />\n'
+            '{"stat":"ok","result":{"paging":{"page":1},"images":[]}}'
+        )
+        data = pd.PiwigoClient.parse_payload(noisy)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["stat"], "ok")
+
+    def test_html_error_returns_none(self):
+        self.assertIsNone(pd.PiwigoClient.parse_payload("<html><body>502</body></html>"))
+        self.assertIsNone(pd.PiwigoClient.parse_payload(""))
+
+
+class FailingCategoryTest(unittest.TestCase):
+    def test_broken_category_is_skipped(self):
+        cats = [
+            {"id": 1, "name": "A", "id_uppercat": None, "nb_images": 1},
+            {"id": 2, "name": "B", "id_uppercat": None, "nb_images": 1},
+        ]
+
+        class Client:
+            def iter_category_images(self, cat_id, per_page=100):
+                if cat_id == 1:
+                    raise pd.PiwigoError("接口 pwg.categories.getImages 返回非 JSON 内容")
+                yield {"id": 20, "file": "20.jpg"}
+
+        items = pd.collect_images(Client(), cats)
+        self.assertEqual([i.image.id for i in items], [20])
+
+
+# --------------------------------------------------------------------------- #
 # 图片地址选择
 # --------------------------------------------------------------------------- #
 class BestUrlTest(unittest.TestCase):
