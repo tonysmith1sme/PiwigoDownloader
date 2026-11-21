@@ -962,7 +962,12 @@ class Downloader:
                     stats.done += 1
                     stats.bytes += size
                     counters["done"] += 1
-            progress.update(size, counters)
+                served = size if status == "done" else 0
+                snap = len(self.index) if self.index is not None else 0
+            progress.update(served, counters)
+            # 每 500 条落一次索引，进程被杀也不至于全丢
+            if self.index is not None and snap and snap % 500 == 0:
+                self.index.save()
 
         if self.threads == 1:
             for item in items:
