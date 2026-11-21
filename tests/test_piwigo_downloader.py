@@ -123,6 +123,120 @@ class FailingCategoryTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 配置文件与本地索引
+# --------------------------------------------------------------------------- #
+class ConfigTest(unittest.TestCase):
+    def parse(self, argv):
+        return pd.build_parser().parse_args(argv)
+
+    def test_defaults(self):
+        s = pd.resolve_settings(self.parse(["https://x/"]), {})
+        self.assertEqual(s.threads, 16)
+        self.assertEqual(str(s.output), "downloads")
+        self.assertTrue(s.use_index)
+
+    def test_config_overrides_default(self):
+        cfg = {"download": {"threads": 4, "output": "pics", "index": False}}
+        s = pd.resolve_settings(self.parse(["https://x/"]), cfg)
+        self.assertEqual(s.threads, 4)
+        self.assertEqual(str(s.output), "pics")
+        self.assertFalse(s.use_index)
+
+    def test_cli_overrides_config(self):
+        cfg = {"download": {"threads": 4}}
+        s = pd.resolve_settings(self.parse(["https://x/", "--threads", "32"]), cfg)
+        self.assertEqual(s.threads, 32)
+
+    def test_site_url_from_config(self):
+        s = pd.resolve_settings(self.parse([]), {"site": {"url": "https://cfg.example/"}})
+        self.assertEqual(s.url, "https://cfg.example/")
+
+    def test_toml_file_is_loaded(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "piwigo.toml"
+            path.write_text('[download]\nthreads = 2\noutput = "o"\n', encoding="utf-8")
+            cfg = pd.load_config_file(path)
+            self.assertEqual(cfg["download"]["threads"], 2)
+
+
+class LocalIndexTest(unittest.TestCase):
+    def test_roundtrip_and_lookup(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "cat").mkdir()
+            (out / "cat" / "a.jpg").write_bytes(b"x" * 10)
+            idx = pd.LocalIndex(out / ".piwigo_index.json", "https://site")
+            idx.record(1, "cat/a.jpg", 10)
+            idx.save()
+
+            again = pd.LocalIndex(out / ".piwigo_index.json", "https://site").load()
+            self.assertEqual(len(again), 1)
+            self.assertEqual(again.is_downloaded(1, out), (True, 10))
+
+    def test_size_mismatch_is_not_downloaded(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "a.jpg").write_bytes(b"x" * 3)
+            idx = pd.LocalIndex(out / ".piwigo_index.json", "https://site")
+            idx.record(1, "a.jpg", 999)
+            self.assertFalse(idx.is_downloaded(1, out)[0])
+
+    def test_sites_are_isolated(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            path = out / ".piwigo_index.json"
+            a = pd.LocalIndex(path, "https://a").load()
+            a.record(1, "a.jpg", 1)
+            a.save()
+            b = pd.LocalIndex(path, "https://b").load()
+            b.record(1, "b.jpg", 1)
+            b.save()
+            self.assertEqual(len(pd.LocalIndex(path, "https://a").load()), 1)
+            self.assertEqual(len(pd.LocalIndex(path, "https://b").load()), 1)
+
+    def test_verify_prunes_missing_files(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "keep.jpg").write_bytes(b"x" * 5)
+            path = out / ".piwigo_index.json"
+            idx = pd.LocalIndex(path, "https://site")
+            idx.record(1, "keep.jpg", 5)
+            idx.record(2, "gone.jpg", 5)
+            idx.save()
+            result = pd.verify_local_index(path, out)
+            self.assertEqual(result["https://site"], {"ok": 1, "missing": 1, "mismatch": 0})
+            self.assertEqual(len(pd.LocalIndex(path, "https://site").load()), 1)
+
+
+class IndexedSkipTest(unittest.TestCase):
+    def test_indexed_file_is_not_downloaded_again(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "cat").mkdir()
+            (out / "cat" / "a.jpg").write_bytes(b"x" * 7)
+            idx = pd.LocalIndex(out / ".piwigo_index.json", "https://site")
+            idx.record(1, "cat/a.jpg", 7)
+
+            class NoNetwork:
+                verify_tls = True
+                username = None
+
+                def __init__(self):
+                    import requests
+
+                    self.session = requests.Session()
+                    self.base_url = "https://site"
+
+            dl = pd.Downloader(NoNetwork(), out, threads=1, progress=False, index=idx)
+            item = pd.CatalogItem(
+                image=pd.ImageRef(id=1, file="a.jpg", element_url="http://127.0.0.1:1/a.jpg"),
+                rel_dir=Path("cat"),
+            )
+            status, size = dl.download_one(item)
+            self.assertEqual((status, size), ("indexed", 7))
+
+
+# --------------------------------------------------------------------------- #
 # 图片地址选择
 # --------------------------------------------------------------------------- #
 class BestUrlTest(unittest.TestCase):

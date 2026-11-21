@@ -36,7 +36,7 @@ from typing import Any, Iterator, Sequence
 import requests
 from requests.adapters import HTTPAdapter
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 PiwigoDownloader/" + VERSION
@@ -448,6 +448,14 @@ def safe_filename(image: ImageRef, max_len: int = 120) -> str:
     return f"{stem}{ext}"
 
 
+def _rel_to(root: Path, path: Path) -> str:
+    """相对 root 的 POSIX 路径，写入索引时用。"""
+    try:
+        return path.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError):
+        return path.as_posix()
+
+
 def build_category_paths(categories: Sequence[dict[str, Any]]) -> dict[int, list[str]]:
     """按 uppercats 还原目录层级；同级重名追加 id 以免互相覆盖。"""
     by_id: dict[int, dict[str, Any]] = {}
@@ -567,6 +575,136 @@ def _image_dir(image: ImageRef, fallback_cid: int, paths: dict[int, list[str]]) 
 
 
 # --------------------------------------------------------------------------- #
+# 本地索引：记录已下载图片，重跑只补新增
+# --------------------------------------------------------------------------- #
+class LocalIndex:
+    """<output>/.piwigo_index.json 中的图片索引，按站点隔离。
+
+    结构: {"version": 1, "sites": {"https://site": {"images": {"<id>": {...}}}}}
+    """
+
+    def __init__(self, path: Path, site: str) -> None:
+        self.path = Path(path)
+        self.site = site
+        self.images: dict[str, dict[str, Any]] = {}
+        self._doc: dict[str, Any] = {"version": 1, "sites": {}}
+        self._lock = threading.Lock()
+        self._dirty = False
+
+    # -- 读写 -------------------------------------------------------------- #
+    def load(self) -> "LocalIndex":
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return self
+        if not isinstance(data, dict):
+            return self
+        self._doc = data
+        sites = data.get("sites")
+        if isinstance(sites, dict):
+            entry = sites.get(self.site)
+            if isinstance(entry, dict) and isinstance(entry.get("images"), dict):
+                self.images = dict(entry["images"])
+        return self
+
+    def save(self) -> bool:
+        with self._lock:
+            if not self._dirty and self.path.exists():
+                return False
+            sites = self._doc.setdefault("sites", {})
+            sites[self.site] = {
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "images": self.images,
+            }
+            self._doc["version"] = 1
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(self._doc, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path)
+            self._dirty = False
+            return True
+
+    # -- 查询 / 记录 -------------------------------------------------------- #
+    def record(self, image_id: int, rel_path: str, size: int) -> None:
+        with self._lock:
+            self.images[str(image_id)] = {
+                "path": rel_path.replace("\\", "/"),
+                "size": int(size),
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._dirty = True
+
+    def lookup(self, image_id: int) -> dict[str, Any] | None:
+        return self.images.get(str(image_id))
+
+    def is_downloaded(self, image_id: int, out_dir: Path) -> tuple[bool, int]:
+        """索引命中且文件仍在、大小一致，才算已下载。"""
+        rec = self.lookup(image_id)
+        if not isinstance(rec, dict) or not rec.get("path"):
+            return False, 0
+        target = out_dir / str(rec["path"])
+        try:
+            size = target.stat().st_size
+        except OSError:
+            return False, 0
+        if size <= 0:
+            return False, 0
+        expected = rec.get("size")
+        if isinstance(expected, int) and expected > 0 and size != expected:
+            return False, 0
+        return True, size
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+
+def verify_local_index(path: Path, out_dir: Path) -> dict[str, dict[str, int]]:
+    """离线体检索引：逐个站点检查文件是否存在、大小是否一致，并剔除失效记录。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    sites = data.get("sites")
+    if not isinstance(sites, dict):
+        return {}
+    results: dict[str, dict[str, int]] = {}
+    for site, entry in sites.items():
+        if not isinstance(entry, dict):
+            continue
+        images = entry.get("images")
+        if not isinstance(images, dict):
+            continue
+        ok = missing = mismatch = 0
+        for key in list(images):
+            rec = images.get(key)
+            rel = str((rec or {}).get("path") or "")
+            target = out_dir / rel if rel else None
+            try:
+                size = target.stat().st_size if target is not None else 0
+            except OSError:
+                size = 0
+            if size <= 0:
+                images.pop(key, None)
+                missing += 1
+                continue
+            expected = (rec or {}).get("size")
+            if isinstance(expected, int) and expected > 0 and size != expected:
+                images.pop(key, None)
+                mismatch += 1
+                continue
+            ok += 1
+        entry["images"] = images
+        results[site] = {"ok": ok, "missing": missing, "mismatch": mismatch}
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        log.warning("索引写回失败: %s", exc)
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # 下载器
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -574,6 +712,7 @@ class DownloadStats:
     total: int = 0
     done: int = 0
     skipped: int = 0
+    indexed: int = 0
     failed: int = 0
     bytes: int = 0
     skipped_bytes: int = 0
@@ -648,7 +787,7 @@ def human_size(num: float) -> str:
 
 
 class Downloader:
-    """并发下载 + 断点续传 + 结果清单。"""
+    """并发下载 + 断点续传 + 本地索引增量 + 结果清单。"""
 
     def __init__(
         self,
@@ -660,6 +799,7 @@ class Downloader:
         retries: int = 2,
         overwrite: bool = False,
         progress: bool = True,
+        index: "LocalIndex | None" = None,
     ) -> None:
         self.client = client
         self.out_dir = Path(out_dir)
@@ -668,6 +808,7 @@ class Downloader:
         self.retries = max(0, retries)
         self.overwrite = overwrite
         self.show_progress = progress
+        self.index = index
         self._local = threading.local()
         self._claimed: dict[Path, int] = {}
         self._claim_lock = threading.Lock()
@@ -706,12 +847,21 @@ class Downloader:
         if not url:
             raise PiwigoError(f"图片 #{item.image.id} 没有可用地址")
 
+        # 1) 本地索引命中：文件还在、大小一致 → 直接跳过，不产生任何请求
+        if self.index is not None and not self.overwrite:
+            hit, size = self.index.is_downloaded(item.image.id, self.out_dir)
+            if hit:
+                return "indexed", size
+
         dest = self.resolve_dest(item)
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")
 
         if dest.exists() and dest.stat().st_size > 0 and not self.overwrite:
-            return "skipped", dest.stat().st_size
+            size = dest.stat().st_size
+            if self.index is not None:
+                self.index.record(item.image.id, _rel_to(self.out_dir, dest), size)
+            return "skipped", size
 
         written = 0
         last_err: Exception | None = None
@@ -719,6 +869,8 @@ class Downloader:
             try:
                 written = self._stream_to_file(url, part, dest)
                 os.replace(part, dest)
+                if self.index is not None:
+                    self.index.record(item.image.id, _rel_to(self.out_dir, dest), written)
                 return "done", written
             except AuthRequired:
                 raise
@@ -777,7 +929,7 @@ class Downloader:
             self._claimed.clear()
         stats = DownloadStats(total=len(items))
         progress = Progress(len(items), enabled=self.show_progress)
-        counters = {"done": 0, "skipped": 0, "failed": 0}
+        counters = {"done": 0, "skipped": 0, "indexed": 0, "failed": 0}
         lock = threading.Lock()
 
         def work(item: CatalogItem) -> None:
@@ -798,7 +950,11 @@ class Downloader:
                 progress.update(0, counters)
                 return
             with lock:
-                if status == "skipped":
+                if status == "indexed":
+                    stats.indexed += 1
+                    stats.skipped_bytes += size
+                    counters["indexed"] += 1
+                elif status == "skipped":
                     stats.skipped += 1
                     stats.skipped_bytes += size
                     counters["skipped"] += 1
@@ -815,6 +971,8 @@ class Downloader:
             with ThreadPoolExecutor(max_workers=self.threads) as pool:
                 list(pool.map(work, items))
         progress.close()
+        if self.index is not None:
+            self.index.save()
         if stats.failures:
             log.warning("有 %d 张下载失败，前 5 条：", len(stats.failures))
             for image_id, reason in stats.failures[:5]:
@@ -852,6 +1010,146 @@ class Downloader:
         return path
 
 
+
+# --------------------------------------------------------------------------- #
+# 配置
+# --------------------------------------------------------------------------- #
+DEFAULT_CONFIG_FILE = "piwigo.toml"
+DEFAULT_THREADS = 16
+
+CONFIG_TEMPLATE = """# PiwigoDownloader 配置文件（TOML）
+# 命令行参数优先级更高，可临时覆盖任意一项。
+# 用 --init-config 生成此模板，用 --config 指定其它路径。
+
+[site]
+# 默认站点地址；命令行给了 url 时以命令行为准
+url = ""
+
+[download]
+output = "downloads"        # 下载根目录
+threads = 16                # 并发下载线程数
+per_page = 100              # 接口分页大小
+timeout = 30.0              # 单请求超时（秒）
+retries = 3                 # 单张图片失败重试次数
+delay = 0.12                # 接口分页间隔（秒）
+max_images = 0              # 最多下载张数，0 为不限
+overwrite = false           # 已存在文件是否重下
+flat = false                # 平铺保存，不建分类目录
+progress = true             # 是否显示进度
+index = true                # 启用本地索引，重跑只补新增图片
+index_file = ".piwigo_index.json"
+
+[network]
+proxy = ""                  # 例如 http://127.0.0.1:7890
+insecure = false            # 跳过 TLS 证书校验
+
+[auth]
+username = ""               # 留空则按需询问
+force_login = false         # 匿名可读也先登录，纳入私有相册
+no_login_prompt = false     # 需要登录时不询问，直接退出
+"""
+
+
+@dataclass
+class Settings:
+    """配置文件与命令行合并后的最终配置。"""
+
+    url: str = ""
+    output: Path = Path("downloads")
+    username: str | None = None
+    password: str = ""
+    ask_password: bool = False
+    force_login: bool = False
+    no_login_prompt: bool = False
+    threads: int = DEFAULT_THREADS
+    per_page: int = DEFAULT_PER_PAGE
+    max_images: int = 0
+    categories: list[int] = field(default_factory=list)
+    flat: bool = False
+    dry_run: bool = False
+    list_only: bool = False
+    check_local: bool = False
+    overwrite: bool = False
+    progress: bool = True
+    timeout: float = DEFAULT_TIMEOUT
+    retries: int = DEFAULT_RETRIES
+    delay: float = 0.12
+    proxy: str | None = None
+    insecure: bool = False
+    verbose: bool = False
+    use_index: bool = True
+    index_file: str = ".piwigo_index.json"
+
+
+def load_config_file(path: Path) -> dict[str, Any]:
+    """读取 TOML / JSON 配置；文件不存在返回空字典。"""
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise PiwigoError(f"配置文件解析失败（JSON）{path}: {exc}") from exc
+        return data if isinstance(data, dict) else {}
+    try:
+        import tomllib
+    except ModuleNotFoundError as exc:  # pragma: no cover - py<3.11
+        raise PiwigoError("当前 Python 无 tomllib（需 3.11+），请改用 .json 配置文件") from exc
+    try:
+        return tomllib.loads(text)
+    except Exception as exc:  # noqa: BLE001 - tomllib 抛 TOMLDecodeError
+        raise PiwigoError(f"配置文件解析失败（TOML）{path}: {exc}") from exc
+
+
+def _pick(*values: Any, default: Any = None) -> Any:
+    """取第一个非 None 且非空串的值。"""
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return default
+
+
+def resolve_settings(args: argparse.Namespace, cfg: dict[str, Any]) -> Settings:
+    """合并命令行与配置文件：命令行 > 配置 > 内置默认。"""
+    site = cfg.get("site") or {}
+    dl = cfg.get("download") or {}
+    net = cfg.get("network") or {}
+    auth = cfg.get("auth") or {}
+
+    threads = int(_pick(args.threads, dl.get("threads"), default=DEFAULT_THREADS))
+    per_page = int(_pick(args.per_page, dl.get("per_page"), default=DEFAULT_PER_PAGE))
+
+    return Settings(
+        url=str(_pick(args.url, site.get("url"), default="")),
+        output=Path(str(_pick(args.output, dl.get("output"), default="downloads"))),
+        username=_pick(args.username, auth.get("username"), default=None),
+        password=str(args.password or ""),
+        ask_password=bool(args.ask_password),
+        force_login=bool(args.force_login) or bool(auth.get("force_login", False)),
+        no_login_prompt=bool(args.no_login_prompt) or bool(auth.get("no_login_prompt", False)),
+        threads=threads,
+        per_page=per_page,
+        max_images=int(_pick(args.max_images, dl.get("max_images"), default=0)),
+        categories=list(args.category or []),
+        flat=bool(args.flat) or bool(dl.get("flat", False)),
+        dry_run=bool(args.dry_run),
+        list_only=bool(args.list),
+        check_local=bool(args.check_local),
+        overwrite=bool(args.overwrite) or bool(dl.get("overwrite", False)),
+        progress=not args.no_progress and bool(dl.get("progress", True)),
+        timeout=float(_pick(args.timeout, dl.get("timeout"), default=DEFAULT_TIMEOUT)),
+        retries=int(_pick(args.retries, dl.get("retries"), default=DEFAULT_RETRIES)),
+        delay=float(_pick(args.delay, dl.get("delay"), default=0.12)),
+        proxy=_pick(args.proxy, net.get("proxy"), default=None),
+        insecure=bool(args.insecure) or bool(net.get("insecure", False)),
+        verbose=bool(args.verbose),
+        use_index=not args.no_index and bool(dl.get("index", True)),
+        index_file=str(dl.get("index_file") or ".piwigo_index.json"),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 命令行入口
 # --------------------------------------------------------------------------- #
@@ -868,13 +1166,19 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python piwigo_downloader.py https://gallery.example.com/ -o downloads\n"
-            "  python piwigo_downloader.py https://gallery.example.com/ -u USER -p PASS --threads 8\n"
-            "  python piwigo_downloader.py https://gallery.example.com/ --max-images 20 --dry-run\n"
+            "  python piwigo_downloader.py --init-config          # 生成 piwigo.toml 配置模板\n"
+            "  python piwigo_downloader.py https://gallery.example.com/\n"
+            "  python piwigo_downloader.py --config my.toml --threads 32\n"
+            "  python piwigo_downloader.py --check-local          # 离线体检本地图片\n"
         ),
     )
-    parser.add_argument("url", help="Piwigo 站点根地址，例如 https://gallery.example.com/")
-    parser.add_argument("-o", "--output", default="downloads", help="下载目录（默认 downloads）")
+    parser.add_argument(
+        "url", nargs="?", help="Piwigo 站点根地址；也可写在配置文件的 [site] url 里"
+    )
+    parser.add_argument("-c", "--config", help=f"配置文件路径（默认 {DEFAULT_CONFIG_FILE}）")
+    parser.add_argument("--no-config", action="store_true", help="忽略配置文件，只用命令行与内置默认")
+    parser.add_argument("--init-config", action="store_true", help="在当前目录生成配置模板后退出")
+    parser.add_argument("-o", "--output", help="下载目录（默认 downloads）")
     parser.add_argument("-u", "--username", help="Piwigo 用户名；不给则按需交互询问")
     parser.add_argument("-p", "--password", help="Piwigo 密码；不建议明文写在命令里")
     parser.add_argument(
@@ -892,18 +1196,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="匿名不可读时不再询问，直接报错退出（适合脚本/定时任务）",
     )
-    parser.add_argument("--threads", type=int, default=6, help="并发下载线程数（默认 6）")
-    parser.add_argument("--per-page", type=int, default=DEFAULT_PER_PAGE, help="接口分页大小")
-    parser.add_argument("--max-images", type=int, default=0, help="最多下载多少张（0 表示不限）")
+    parser.add_argument("--threads", type=int, help="并发下载线程数")
+    parser.add_argument("--per-page", type=int, help="接口分页大小")
+    parser.add_argument("--max-images", type=int, help="最多下载多少张（0 表示不限）")
     parser.add_argument("--category", type=int, action="append", help="只下载指定分类 id，可重复")
     parser.add_argument("--flat", action="store_true", help="不建分类子目录，全部平铺")
     parser.add_argument("--dry-run", action="store_true", help="只枚举不下载，输出统计")
     parser.add_argument("--list", action="store_true", help="只列出分类与张数")
+    parser.add_argument(
+        "--check-local",
+        action="store_true",
+        help="只体检本地已下载图片（不联网），并剔除索引里的失效记录",
+    )
     parser.add_argument("--overwrite", action="store_true", help="已存在文件也重新下载")
+    parser.add_argument("--no-index", action="store_true", help="关闭本地索引，仅按文件是否存在跳过")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="单请求超时秒数")
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="失败重试次数")
-    parser.add_argument("--delay", type=float, default=0.12, help="接口分页间隔秒数（默认 0.12）")
+    parser.add_argument("--timeout", type=float, help="单请求超时秒数")
+    parser.add_argument("--retries", type=int, help="失败重试次数")
+    parser.add_argument("--delay", type=float, help="接口分页间隔秒数")
     parser.add_argument("--proxy", help="HTTP(S) 代理，例如 http://127.0.0.1:7890")
     parser.add_argument("--insecure", action="store_true", help="跳过 TLS 证书校验")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
@@ -929,18 +1239,18 @@ def prompt_credentials(attempt: int = 1) -> tuple[str, str] | None:
     return username, password
 
 
-def collect_credentials(args: argparse.Namespace, allow_prompt: bool) -> tuple[str, str] | None:
+def collect_credentials(settings: Settings, allow_prompt: bool) -> tuple[str, str] | None:
     """按 -u/-p/环境变量/交互的顺序取凭据。"""
-    username = (args.username or "").strip()
-    password = args.password or ""
-    if args.ask_password:
+    username = (settings.username or "").strip()
+    password = settings.password or ""
+    if settings.ask_password:
         password = ""
     if not password:
         password = os.environ.get("PIWIGO_PASSWORD", "")
     if username and password:
         return username, password
     if not allow_prompt:
-        return (username, password) if username and password else None
+        return None
 
     for attempt in range(1, 4):
         if not username:
@@ -959,12 +1269,12 @@ def collect_credentials(args: argparse.Namespace, allow_prompt: bool) -> tuple[s
     return None
 
 
-def authenticate(client: PiwigoClient, args: argparse.Namespace, *, allow_prompt: bool) -> bool:
+def authenticate(client: PiwigoClient, settings: Settings, *, allow_prompt: bool) -> bool:
     """需要登录时取凭据并尝试登录，失败允许有限次重试。"""
     log.info("该站点需要账号密码才能读取图库内容，准备登录。")
     attempts = 3 if allow_prompt else 1
     for attempt in range(1, attempts + 1):
-        creds = collect_credentials(args, allow_prompt=allow_prompt)
+        creds = collect_credentials(settings, allow_prompt=allow_prompt)
         if not creds or not creds[0] or not creds[1]:
             return False
         username, password = creds
@@ -973,18 +1283,44 @@ def authenticate(client: PiwigoClient, args: argparse.Namespace, *, allow_prompt
             return True
         log.warning("登录失败：账号或密码不正确")
         # 清空已用凭据，下一轮重新询问
-        args.username, args.password = None, ""
+        settings.username, settings.password = None, ""
     return False
 
 
-def run(args: argparse.Namespace) -> int:
+def run(settings: Settings) -> int:
+    out_dir = settings.output.expanduser()
+
+    # 0) 纯本地体检，不联网
+    if settings.check_local:
+        if not settings.use_index:
+            log.error("--check-local 需要启用本地索引（去掉 --no-index）")
+            return EXIT_ERROR
+        path = out_dir / settings.index_file
+        if not path.exists():
+            log.error("还没有本地索引: %s（先跑一次下载再说）", path)
+            return EXIT_ERROR
+        results = verify_local_index(path, out_dir)
+        if not results:
+            log.warning("索引里没有可用记录: %s", path)
+            return EXIT_OK
+        for site, stat in results.items():
+            log.info(
+                "%s：正常 %d 张，缺失 %d 张，大小不符 %d 张",
+                site,
+                stat["ok"],
+                stat["missing"],
+                stat["mismatch"],
+            )
+        log.info("索引已更新，失效记录已剔除，下次运行会重新下载这些图片")
+        return EXIT_OK
+
     client = PiwigoClient(
-        args.url,
-        timeout=args.timeout,
-        retries=args.retries,
-        delay=args.delay,
-        verify_tls=not args.insecure,
-        proxy=args.proxy,
+        settings.url,
+        timeout=settings.timeout,
+        retries=settings.retries,
+        delay=settings.delay,
+        verify_tls=not settings.insecure,
+        proxy=settings.proxy,
     )
 
     # 1) 匿名探测
@@ -1001,13 +1337,13 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # 2) 需要时登录
-    if info["needs_auth"] or (args.force_login and client.is_guest()):
+    if info["needs_auth"] or (settings.force_login and client.is_guest()):
         if info["needs_auth"]:
             log.info("匿名可见内容为空（%s）", info.get("reason") or "需要登录")
         else:
             log.info("按 --force-login 要求先登录")
-        if not authenticate(client, args, allow_prompt=not args.no_login_prompt):
-            if args.no_login_prompt:
+        if not authenticate(client, settings, allow_prompt=not settings.no_login_prompt):
+            if settings.no_login_prompt:
                 log.error("登录未成功：请检查 -u/--username 与 -p/--password（当前已禁用交互提示）")
             else:
                 log.error("未获得有效凭据，退出")
@@ -1017,10 +1353,10 @@ def run(args: argparse.Namespace) -> int:
         except PiwigoError as exc:
             log.error("登录后读取分类失败: %s", exc)
             return EXIT_ERROR
-    elif args.username:
+    elif settings.username:
         # 站点匿名可读，但用户仍提供了账号：登录以纳入私有内容
         log.info("站点匿名可读，尝试用提供的账号纳入私有内容")
-        creds = collect_credentials(args, allow_prompt=not args.no_login_prompt)
+        creds = collect_credentials(settings, allow_prompt=not settings.no_login_prompt)
         if creds and client.login(*creds):
             info = client.probe()
         else:
@@ -1031,7 +1367,7 @@ def run(args: argparse.Namespace) -> int:
         log.error("没有读到任何分类，站点可能是空的或权限不足")
         return EXIT_ERROR
 
-    if args.list:
+    if settings.list_only:
         for cat in categories:
             depth = str(cat.get("uppercats") or "").count(",")
             indent = "  " * depth
@@ -1045,15 +1381,15 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     # 3) 枚举
-    only = set(args.category) if args.category else None
+    only = set(settings.categories) if settings.categories else None
     try:
         items = collect_images(
             client,
             categories,
-            per_page=args.per_page,
+            per_page=settings.per_page,
             only_categories=only,
-            max_images=args.max_images or None,
-            flat=args.flat,
+            max_images=settings.max_images or None,
+            flat=settings.flat,
         )
     except AuthRequired:
         log.error("枚举过程中被要求登录，请提供有效凭据后重试")
@@ -1062,34 +1398,39 @@ def run(args: argparse.Namespace) -> int:
         log.error("枚举图片失败: %s", exc)
         return EXIT_ERROR
 
-    log.info("待下载图片: %d 张", len(items))
+    log.info("站点图片: %d 张（已去重）", len(items))
     if not items:
         log.warning("没有符合条件的图片")
         return EXIT_OK
 
-    if args.dry_run:
-        for item in items[:10]:
-            log.info(
-                "  #%s %s/%s",
-                item.image.id,
-                item.rel_dir,
-                safe_filename(item.image),
-            )
-        if len(items) > 10:
-            log.info("  ... 其余 %d 张省略", len(items) - 10)
+    # 4) 本地索引：统计已有、待补
+    index: LocalIndex | None = None
+    if settings.use_index:
+        index = LocalIndex(out_dir / settings.index_file, client.base_url).load()
+        known = sum(1 for item in items if index.is_downloaded(item.image.id, out_dir)[0])
+        log.info("本地索引已有 %d 张，待补 %d 张", known, len(items) - known)
+
+    if settings.dry_run:
+        pending = [
+            i for i in items if not (index and index.is_downloaded(i.image.id, out_dir)[0])
+        ]
+        for item in pending[:10]:
+            log.info("  #%s %s/%s", item.image.id, item.rel_dir, safe_filename(item.image))
+        if len(pending) > 10:
+            log.info("  ... 其余 %d 张省略", len(pending) - 10)
         log.info("dry-run 结束，未下载任何文件")
         return EXIT_OK
 
-    # 4) 下载
-    out_dir = Path(args.output).expanduser()
+    # 5) 下载
     downloader = Downloader(
         client,
         out_dir,
-        threads=args.threads,
-        timeout=max(args.timeout, 60.0),
-        retries=max(1, min(args.retries, 5)),
-        overwrite=args.overwrite,
-        progress=not args.no_progress,
+        threads=settings.threads,
+        timeout=max(settings.timeout, 60.0),
+        retries=max(1, min(settings.retries, 6)),
+        overwrite=settings.overwrite,
+        progress=settings.progress,
+        index=index,
     )
     started = time.monotonic()
     stats = downloader.run(items)
@@ -1097,17 +1438,20 @@ def run(args: argparse.Namespace) -> int:
     manifest = downloader.write_manifest(items, stats)
 
     log.info(
-        "完成：新增 %d 张 / 跳过 %d 张 / 失败 %d 张，新下载 %s，用时 %.1fs（%s/s）",
+        "完成：新增 %d 张 / 索引跳过 %d 张 / 本地跳过 %d 张 / 失败 %d 张，新下载 %s，用时 %.1fs（%s/s）",
         stats.done,
+        stats.indexed,
         stats.skipped,
         stats.failed,
         human_size(stats.bytes),
         elapsed,
         human_size(int(stats.bytes / elapsed)),
     )
-    if stats.skipped:
+    if stats.skipped_bytes:
         log.info("已存在文件共 %s，未重复下载", human_size(stats.skipped_bytes))
-    log.info("清单: %s", manifest)
+    if index is not None:
+        log.info("本地索引: %s（%d 张）", index.path, len(index))
+    log.info("本次清单: %s", manifest)
     return EXIT_OK if stats.failed == 0 else EXIT_ERROR
 
 
@@ -1124,14 +1468,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.verbose:
+
+    if args.init_config:
+        target = Path(args.config or DEFAULT_CONFIG_FILE)
+        if target.exists():
+            log.error("配置模板已存在: %s（如需重建请先删除）", target)
+            return EXIT_ERROR
+        target.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        log.info("已生成配置模板: %s", target)
+        return EXIT_OK
+
+    cfg: dict[str, Any] = {}
+    if not args.no_config:
+        cfg_path = Path(args.config) if args.config else Path(DEFAULT_CONFIG_FILE)
+        if cfg_path.exists():
+            cfg = load_config_file(cfg_path)
+            log.info("读取配置: %s", cfg_path)
+        elif args.config:
+            log.error("配置文件不存在: %s", cfg_path)
+            return EXIT_ERROR
+
+    settings = resolve_settings(args, cfg)
+    if settings.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    if args.threads < 1:
+
+    if not settings.url and not settings.check_local:
+        parser.error("缺少站点地址：请给出 url 参数，或在配置文件的 [site] url 中设置")
+    if settings.threads < 1:
         parser.error("--threads 必须 >= 1")
-    if args.per_page < 1 or args.per_page > 500:
+    if settings.per_page < 1 or settings.per_page > 500:
         parser.error("--per-page 需在 1..500 之间")
+
     try:
-        return run(args)
+        return run(settings)
     except KeyboardInterrupt:
         log.warning("已中断")
         return 130

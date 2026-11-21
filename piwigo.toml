@@ -1,0 +1,30 @@
+# PiwigoDownloader 配置文件（TOML）
+# 命令行参数优先级更高，可临时覆盖任意一项。
+# 用 --init-config 生成此模板，用 --config 指定其它路径。
+
+[site]
+# 默认站点地址；命令行给了 url 时以命令行为准
+url = ""
+
+[download]
+output = "downloads"        # 下载根目录
+threads = 16                # 并发下载线程数
+per_page = 100              # 接口分页大小
+timeout = 30.0              # 单请求超时（秒）
+retries = 3                 # 单张图片失败重试次数
+delay = 0.12                # 接口分页间隔（秒）
+max_images = 0              # 最多下载张数，0 为不限
+overwrite = false           # 已存在文件是否重下
+flat = false                # 平铺保存，不建分类目录
+progress = true             # 是否显示进度
+index = true                # 启用本地索引，重跑只补新增图片
+index_file = ".piwigo_index.json"
+
+[network]
+proxy = ""                  # 例如 http://127.0.0.1:7890
+insecure = false            # 跳过 TLS 证书校验
+
+[auth]
+username = ""               # 留空则按需询问
+force_login = false         # 匿名可读也先登录，纳入私有相册
+no_login_prompt = false     # 需要登录时不询问，直接退出
